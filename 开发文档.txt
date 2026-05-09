@@ -1,0 +1,287 @@
+# 微信公众号文章数据分析工具——开发文档
+
+**版本**：v1.0  
+**更新日期**：2026-05-08  
+**核心AI引擎**：智谱AI开放平台免费模型（GLM-4-Flash / ChatGLM3-6B 等）
+
+---
+
+## 1. 文档概述
+
+本文档面向后端开发、算法工程师及运维人员，描述微信公众号文章数据分析工具（代号 **WeAnalyzer**）的技术架构、模块设计、接口规范及AI智能分析模块的实现细节。系统的主要目标是为公众号运营者提供内容分析、用户洞察、竞品监测与AI决策建议。AI能力全部基于**智谱AI开放平台的免费模型**（优先 `glm-4-flash`，免费额度充足），在成本可控的前提下实现内容标签提取、质量评分、异常归因、选题推荐等智能功能。
+
+---
+
+## 2. 总体架构
+
+### 2.1 架构图
+```
+┌─────────────┐      ┌──────────────┐      ┌─────────────────┐
+│   Web前端    │◄────►│  API网关(Nginx│◄────►│  微服务集群      │
+│  (React)    │      │   + 鉴权)     │      │  - 数据采集服务  │
+└─────────────┘      └──────────────┘      │  - 指标计算服务  │
+                                           │  - 内容分析服务  │
+                                           │  - 用户分析服务  │
+                                           │  - AI分析服务    │
+                                           │  - 报告生成服务  │
+                                           └───────┬─────────┘
+                                                   │
+               ┌───────────────────────────────────┼────────────────────┐
+               │                                   │                    │
+        ┌──────▼──────┐   ┌──────────┐   ┌────────▼──────┐   ┌────────▼──────┐
+        │  数据仓库    │   │ 消息队列  │   │  缓存(Redis)  │   │  对象存储     │
+        │(ClickHouse) │   │ (Kafka)   │   │              │   │  (MinIO/OSS) │
+        └──────┬──────┘   └──────────┘   └───────────────┘   └───────────────┘
+               │
+     ┌─────────┼─────────┐
+     │         │         │
+┌────▼───┐ ┌───▼───┐ ┌───▼───┐
+│MySQL   │ │ES     │ │智谱AI │
+│(元数据)│ │(全文)  │ │(API)  │
+└────────┘ └───────┘ └───────┘
+```
+
+### 2.2 技术选型
+
+| 层次       | 技术组件                      | 说明 |
+|------------|-------------------------------|------|
+| 前端       | React 18 + Ant Design + ECharts | 看板、报表展示 |
+| 后端框架   | Spring Boot 3 / Go Gin        | 微服务核心，Java生态更成熟 |
+| API网关    | Nginx + Spring Cloud Gateway  | 路由、限流、鉴权 |
+| 数据库     | MySQL 8.0                     | 用户、账号、配置 |
+| OLAP       | ClickHouse                    | 阅读、分享等海量事件实时分析 |
+| 全文检索   | Elasticsearch 8.x             | 文章内容检索、标签聚合 |
+| 缓存       | Redis 7                       | 热点数据、实时计数、分布式锁 |
+| 消息队列   | Apache Kafka                  | 事件解耦、异步任务 |
+| 对象存储   | MinIO / 阿里云OSS             | 报表PDF、图片素材 |
+| 任务调度   | Apache DolphinScheduler       | ETL、离线指标计算 |
+| 容器编排   | Kubernetes (K8s) + Docker     | 部署与弹性伸缩 |
+| AI引擎     | **智谱AI开放平台 (glm-4-flash)** | 内容分析、建议生成等 |
+| NLP辅助    | jieba + TF-IDF                | 关键词提取（离线快速版） |
+
+---
+
+## 3. AI分析模块详细设计（基于智谱免费模型）
+
+### 3.1 模型选型与接入
+
+智谱AI提供多种免费模型，我们优先使用 **GLM-4-Flash**（免费，支持128K上下文，速度快）。备选模型 `ChatGLM3-6B`（开源私有化部署，用于数据敏感场景）。
+
+**接口地址**：`https://open.bigmodel.cn/api/paas/v4/chat/completions`  
+**认证方式**：JWT Token，通过 API Key 生成。  
+**速率限制**：免费用户 10次/秒，每天10万tokens（具体以官网为准），需实现本地队列控制。
+
+#### 3.1.1 官方 SDK 集成（Java）
+
+引入依赖（Maven）：
+```xml
+<dependency>
+    <groupId>com.zhipu.oapi</groupId>
+    <artifactId>zhipu-sdk-java</artifactId>
+    <version>4.1.0</version>
+</dependency>
+```
+
+封装 `ZhipuAiClient`：
+```java
+@Service
+public class ZhipuAiClient {
+    private final ZhipuAiApiClient client;
+
+    public ZhipuAiClient(@Value("${zhipu.api-key}") String apiKey) {
+        this.client = new ZhipuAiApiClient(apiKey);
+    }
+
+    public String chat(String prompt, String systemMessage) {
+        ChatCompletionRequest request = ChatCompletionRequest.builder()
+            .model("glm-4-flash")  // 免费模型
+            .messages(Arrays.asList(
+                new ChatMessage("system", systemMessage),
+                new ChatMessage("user", prompt)
+            ))
+            .temperature(0.7)
+            .maxTokens(1024)
+            .build();
+        ChatCompletionResponse response = client.chatCompletion(request);
+        return response.getData().getChoices().get(0).getMessage().getContent();
+    }
+}
+```
+
+#### 3.1.2 并发控制与容错
+- **本地限流**：使用 Guava RateLimiter 控制每秒请求数（如 8 req/s）。
+- **重试机制**：遇到429（Too Many Requests）时，指数退避重试（最多3次）。
+- **结果缓存**：对相同提示词+参数，Redis缓存1小时，减少重复调用。
+
+### 3.2 核心AI应用场景及提示词工程
+
+#### 场景1：文章自动标签提取
+**输入**：文章标题、正文（前1500字，去HTML标签）  
+**输出**：JSON数组，包含3-5个标签，每个标签附带权重(0-1)  
+**提示词设计**：
+```
+system: 你是微信公众号内容分析专家。根据文章标题和正文，提取最核心的3-5个内容标签，每个标签附带0-1之间的相关度权重。只返回JSON，格式：[{"tag":"标签名","weight":0.95},...]。
+user: 标题：${title}\n正文：${content}
+```
+调用时 `temperature=0.3`，确保稳定性。解析JSON后进行去噪（去掉过泛标签如“微信”）。
+
+#### 场景2：文章质量多维度评分
+**输入**：标题、正文、阅读量（可选）  
+**输出**：JSON包含5个维度的评分（1-10分）及综合分数。维度：信息密度、观点新颖度、结构逻辑、表达吸引力、实用价值。  
+**提示词**：
+```
+system: 你是内容质量评审专家，请对以下公众号文章打分。只返回JSON，格式：{"info_density":8,"originality":7,"logic":9,"attraction":6,"practical_value":8,"overall":7.6}。
+user: 标题：${title}\n正文：${content}
+```
+可结合阅读量数据微调：若阅读量极高但内容分低，说明标题党，调整“表达吸引力”权重。
+
+#### 场景3：运营分析诊断与建议
+**输入**：近7日各项指标（阅读量、分享率、取关数等）的文本描述  
+**输出**：自然语言洞察，1-2条核心建议  
+**提示词**：
+```
+system: 你是顶尖的公众号运营顾问。根据数据描述，指出账号当前最需要解决的问题，并给出具体可执行的改进建议。语气客观、直接，避免空话。
+user: 过去7天数据：总阅读量比前一周下降12%，分享率从2.3%降至1.8%，净增粉丝-35。主要发文是3篇行业资讯和1篇产品更新。
+```
+模型会归因到内容类型可能不符合粉丝偏好，建议回归原有优势选题。
+
+#### 场景4：标题吸引力分析
+**输入**：历史标题列表（最多10个）  
+**输出**：分析这些标题的共性（句式、情绪词、数字使用），给出优化方向  
+**提示词**：
+```
+system: 你是一位标题优化专家。分析下列标题的共同特征，指出哪些要素可能带来更高打开率，并提出2-3条改进原则。回复条理化。
+user: 标题1: ...\n标题2: ...
+```
+
+#### 场景5：热点事件选题推荐
+**输入**：当日热点关键词列表（来自搜一搜、微博等API）  
+**输出**：结合账号历史偏好（标签），生成3个可选题方向及理由  
+**提示词**：
+```
+system: 根据提供的今日热点关键词和本账号长期内容风格，生成3个不同的切入角度，贴合账号调性，吸引目标读者。
+user: 账号标签：科技、AI工具、产品经理\n今日热点关键词：Apple Vision Pro 降价\n请给出3个选题建议。
+```
+
+### 3.3 离线批量处理与在线实时调用策略
+
+- **实时场景**：文章发布后立即抓取并分析（标签、质量分），用户体验<3秒返回，使用异步任务+回调更新。
+- **离线批量**：每日凌晨，对昨日全部文章调用AI分析，更新数据库。使用Kafka消费者组并发处理，速率限制在5 QPS（避免触发免费限额）。
+- **智谱免费额度监控**：每日统计Token用量，接近上限时自动降级至本地规则（如仅用TF-IDF标签提取），或切换到备用开源模型（如本地ChatGLM3-6B）。
+
+---
+
+## 4. 数据模型设计（核心表）
+
+### 4.1 文章分析结果表 `article_analysis`
+```sql
+CREATE TABLE article_analysis (
+    id BIGINT PRIMARY KEY,
+    article_id BIGINT NOT NULL,          -- 关联文章表
+    tags JSON,                           -- [{"tag":"AI","weight":0.95},...]
+    quality_score DECIMAL(3,1),          -- 综合质量分 0-10
+    dimension_scores JSON,               -- {"info_density":8,...}
+    ai_summary TEXT,                     -- AI生成的文章摘要(150字)
+    is_title_clickbaity BOOLEAN,         -- 是否疑似标题党
+    title_attraction_score INT,          -- 标题吸引力指数
+    analysis_version VARCHAR(20),
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+### 4.2 AI建议日志 `ai_suggestions`
+```sql
+CREATE TABLE ai_suggestions (
+    id BIGINT PRIMARY KEY,
+    account_id BIGINT,
+    suggestion_type ENUM('DAILY_TIP','ANOMALY','TITLE_OPT','TOPIC'),
+    content TEXT,                         -- AI生成的建议原文
+    related_data JSON,                    -- 相关指标上下文
+    is_adopted BOOLEAN DEFAULT FALSE,
+    created_at DATETIME
+);
+```
+
+### 4.3 用户画像兴趣标签 `user_interest_tags`
+结合用户阅读记录和AI标签，构建倒排索引存于Elasticsearch。
+
+---
+
+## 5. API接口设计（部分）
+
+所有接口遵循RESTful，使用JWT认证。
+
+### 5.1 触发文章AI分析
+- **POST** `/api/v1/analysis/articles/ai`
+- **Body**:
+  ```json
+  {
+    "article_id": 12345,
+    "force_update": false
+  }
+  ```
+- **Response**:
+  ```json
+  {
+    "code": 0,
+    "data": {
+      "task_id": "uuid-task",
+      "status": "processing"
+    }
+  }
+  ```
+（异步：调用智谱API后，通过WebSocket或轮询获取结果）
+
+### 5.2 获取AI运营诊断
+- **GET** `/api/v1/analysis/accounts/{account_id}/diagnosis?days=7`
+- **Response**:
+  ```json
+  {
+    "code": 0,
+    "data": {
+      "summary": "近7天阅读量下滑12%，主要原因是...",
+      "suggestions": [
+        "增加‘实操干货’类内容占比至60%",
+        "尝试在周四晚间发布次条"
+      ]
+    }
+  }
+  ```
+
+### 5.3 批量文章标签及质量查询
+- **GET** `/api/v1/analysis/articles?start_date=2026-05-01&end_date=2026-05-07`
+- **Response**: 列表包含 tags, overall_score 等字段。
+
+---
+
+## 6. 部署与运维
+
+### 6.1 环境变量配置
+```properties
+# 智谱AI
+zhipu.api-key=your_api_key_here
+zhipu.model=glm-4-flash
+zhipu.max-tokens-per-day=80000
+# 数据库
+spring.datasource.url=jdbc:mysql://...
+# ClickHouse, Redis, Kafka 等
+```
+
+### 6.2 监控与告警
+- **智谱API调用**：通过Micrometer + Prometheus采集调用次数、延迟、错误率。
+- **免费额度耗尽报警**：当剩余Token低于1万时，发送钉钉/企微消息。
+- **降级开关**：配置中心（Nacos）可一键关闭AI分析，切换为本地算法。
+
+### 6.3 私有化备选
+若智谱免费接口不可用或数据敏感，可部署开源 **ChatGLM3-6B** 模型（需GPU）作为本地替代，API接口兼容OpenAI格式，微服务通过配置切换base_url即可。
+
+---
+
+## 7. 安全与隐私
+
+- 用户公众号数据隔离，数据库按 account_id 分区。
+- 调用AI的内容脱敏：去除用户手机号、身份证等敏感信息（预处理）。
+- 智谱API传输加密（HTTPS），不在日志中记录完整正文，只存摘要。
+
+---
+
