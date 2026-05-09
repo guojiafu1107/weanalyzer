@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 from pydantic import BaseModel
 
 from database import engine, get_db
-from models import Base, Article, ArticleAnalysis
+from models import Base, Account, Article, ArticleAnalysis
 from schemas import ApiResponse, AiAnalysisRequest, DiagnosisResponse, ArticleAnalysisOut
 from services import analyze_article, generate_diagnosis, recommend_topics
 
@@ -20,15 +20,51 @@ load_dotenv(encoding='utf-8')
 # Create tables
 Base.metadata.create_all(bind=engine)
 
+
+def seed_data():
+    """首次部署时写入测试数据"""
+    from sqlalchemy.orm import Session
+    from sqlalchemy import text
+    db = Session(bind=engine)
+    try:
+        if db.query(Account).count() == 0:
+            db.execute(text("""
+                INSERT INTO accounts (app_id, name, description) VALUES
+                ('wx_test_001', '产品沉思录', '专注产品经理成长与AI工具测评'),
+                ('wx_test_002', '科技瞭望台', '前沿科技资讯与深度解读');
+            """))
+            db.execute(text("""
+                INSERT INTO articles (account_id, title, content, author, read_count, like_count, share_count, publish_time) VALUES
+                (1, '2024年AI工具盘点：这10款让我效率翻倍', '在人工智能快速发展的2024年，各类AI工具层出不穷...', '张产品', 12500, 320, 180, NOW()),
+                (1, '产品经理必懂的5个数据分析模型', '数据驱动决策已成为产品经理的核心能力...', '李数据', 8900, 210, 95, NOW()),
+                (2, '微信新功能深度体验报告', '微信近期上线了一系列新功能，我们进行了为期一周的深度体验...', '王体验', 15200, 450, 320, NOW());
+            """))
+            db.commit()
+            print("=== 初始测试数据已写入 ===")
+    except Exception as e:
+        db.rollback()
+        print(f"=== 种子数据写入失败（可能已存在）: {e} ===")
+    finally:
+        db.close()
+
+
 app = FastAPI(title="WeAnalyzer API", version="1.0.0")
+
+# 生产环境允许所有 origin（Render 前端域名动态分配），开发环境限 localhost
+origins = os.getenv("CORS_ORIGIN", "")
+if not origins:
+    origins = "*"
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[os.getenv("CORS_ORIGIN", "http://localhost:3000")],
-    allow_credentials=True,
+    allow_origins=origins.split(",") if origins != "*" else ["*"],
+    allow_credentials=False if origins == "*" else True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# 首次部署自动写入测试数据
+seed_data()
 
 
 def success_response(data=None):
